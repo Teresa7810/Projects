@@ -1,0 +1,364 @@
+library(fpp3)
+library(lubridate)
+library(urca)
+library(tidyverse)
+library(tsibble)
+library(forecast)  
+library(dplyr)
+
+rain_in_australia <- read.csv('data_group_L.csv')
+
+View(rain_in_australia)
+
+# Format the 'Date' column by replacing the hyphens by slashes
+rain_in_australia <- rain_in_australia %>% mutate(Date = gsub("-", "/", Date))
+
+# Transform the dataset into a tsibble
+rain_in_australia_ts <- rain_in_australia %>%
+  mutate(Month = yearmonth(Date)) %>%
+  group_by(Month) %>% 
+  summarise(Rainfall = mean(Rainfall, na.rm = TRUE)) %>% 
+  select(Month, Rainfall) %>%
+  as_tsibble(index = Month)
+
+View(rain_in_australia_ts)
+
+# Note: Rainfall is the amount of rainfall recorded for the day in mm
+
+# Handling missing values
+
+# Some periods don't have data
+# Feeling the gaps with NaNs
+rain_in_australia_ts <- fill_gaps(rain_in_australia_ts)
+
+# Replacing any missing values in the 'Rainfall' column with the mean value.
+mean_value <- mean(rain_in_australia_ts$Rainfall, na.rm = TRUE)
+rain_in_australia_ts$Rainfall <- ifelse(is.na(rain_in_australia_ts$Rainfall), mean_value, rain_in_australia_ts$Rainfall)
+
+# We don't have missing values anymore
+missing_values_per_column <- sapply(rain_in_australia_ts, function(x) sum(is.na(x)))
+print(missing_values_per_column)
+
+# Plots
+rain_in_australia_ts %>% gg_tsdisplay(Rainfall, plot_type = 'partial')
+
+rain_in_australia_ts %>% gg_season(Rainfall)
+
+rain_in_australia_ts %>% autoplot(Rainfall,  color = "#7e96ab") + 
+  theme(panel.grid.major = element_line(color = "#eeeeee"),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"))
+
+# Non - stationary series
+# We do not have a trend
+
+rain_in_australia_ts %>% gg_subseries(Rainfall)
+
+# Training and Testing sets
+
+# Deciding the proportion we will have for training and testing sets
+start_date <- as.Date("2007-11-01")
+end_date <- as.Date("2017-06-25")
+threshold_date <- as.Date("2015-01-01")
+total_days <- as.numeric(end_date - start_date)
+train_days <- as.numeric(threshold_date - start_date) 
+test_days <- as.numeric(end_date - threshold_date) 
+
+cat(round((train_days/total_days) * 100, 2), '% of the dataset will be training data', round((test_days/total_days) * 100, 2), '% of the dataset will be test data')
+
+# Splitting the data into train and test datasets
+rain_in_australia_ts_train <- rain_in_australia_ts %>% filter(year(Month) < 2015)
+rain_in_australia_ts_test <- rain_in_australia_ts %>% filter(year(Month) >= 2015)
+
+# Variance analysis
+
+rain_in_australia_ts_train %>%
+  ggplot(aes(y = Rainfall, x = Month)) +
+  geom_line(color = 'black') + labs(title = "Daily amount of rainfall (mm)", x = 'Months [1M]', y = 'Rainfall') + 
+  theme_minimal()
+
+# The variance is not stable over time
+
+# Check the log transformation
+rain_in_australia_ts_train %>%
+  ggplot(aes(x = Month, y = log(Rainfall))) +
+  geom_line(color = 'black') + labs(title = "Log-transformed Rainfall", x = 'Months [1M]', y = 'Log(Rainfall) (log(mm))') + 
+  theme_minimal()
+
+# After doing this we notice a very big negative peak, which indicates the presence of zero or near-zero values.
+# After looking at the dataset, we notice that 2008 May has a value very close to zero. Meaning that there were days with very low rainfall amounts
+
+# Therefore we will apply Box-Cox transformation
+
+# Estimating the lambda
+rainfall_ts <- ts(rain_in_australia_ts_train$Rainfall, start = c(2007, 11), frequency = 12)
+lambda_guerrero <- guerrero(rainfall_ts)
+lambda_guerrero
+
+rain_in_australia_ts_train$AdjustedRainfall <- BoxCox(rain_in_australia_ts_train$Rainfall, lambda_guerrero)
+
+rain_in_australia_ts_train %>%
+  ggplot(aes(x = Month, y = AdjustedRainfall)) +
+  geom_line(color = 'black') + labs(title = "Adjusted Rainfall", x = 'Months [1M]', y = 'Adjusted Rainfall') + 
+  theme_minimal()
+
+# Testing if it is Stationary - Augmented Dickey-Fuller (ADF) test
+summary(ur.df(rain_in_australia_ts_train$AdjustedRainfall, type = "none", lags = 12))
+
+# The test statistic (-0.2327) is greater than all the critical values (-2.6, -1.95, -1.61) at the 1%, 5%, and 10% significance levels.
+# This suggests that the test statistic is not significant at any conventional level of significance.
+# Therefore, we fail to reject the null hypothesis of a unit root, indicating that the series is likely non-stationary.
+
+# So, we will take the differences
+# First, the seasonal difference
+
+rain_in_australia_ts_train <- rain_in_australia_ts_train %>%
+  mutate("seasonal_diff_val" = difference(AdjustedRainfall, lag = 12)) %>% na.omit()
+
+rain_in_australia_ts_train %>%
+  ggplot(aes(y = seasonal_diff_val, x = Month))+
+  geom_line(color = 'black') + labs(title = "Adjusted Rainfall- Seasonal Differenced", x = 'Months [1M]', y = 'Adjusted Rainfall') + theme_minimal()
+
+# Note: For the first 12 months of our original time series, we won't have corresponding seasonal difference values because there are no observations 12 months before those.
+
+rain_in_australia_ts_train %>%
+  gg_tsdisplay(seasonal_diff_val, plot_type = 'partial') + labs(title = "Adjusted Rainfall- Seasonal Differenced", x = 'Months [1M]', y = 'Adjusted Rainfall')
+
+# Testing if the seasonally differenced series is stationary - ADF test
+summary(ur.df(rain_in_australia_ts_train$seasonal_diff_val, type = 'none', lags = 12))
+
+# The test statistic (-2.1818 ) is smaller than the critical value at 5% significance level (-1.95). So, we reject H0 at 5% significance level.
+# There is statistical evidence that the seasonally differenced series is stationary
+
+# Since our series is now stationary, let's analyse the ACF and the PACF so we can decide on the candidate models
+rain_in_australia_ts_train %>% gg_tsdisplay(seasonal_diff_val, plot_type = 'partial', lag_max = 36) + 
+  labs(title = "Transformed and Seasonally Differenced Rainfall", x = 'Months [1M]', y = 'Adjusted Rainfall') 
+
+# Model Identification - Selecting the candidate models
+
+fit_1 <- rain_in_australia_ts_train %>%
+  model(
+    sarima002011 = ARIMA(box_cox(Rainfall, lambda_guerrero) ~ pdq(0,0,2) + PDQ(0,1,1)),
+    sarima200011 = ARIMA(box_cox(Rainfall, lambda_guerrero) ~ pdq(2,0,0) + PDQ(0,1,1)),
+    sarima202011 = ARIMA(box_cox(Rainfall, lambda_guerrero) ~ pdq(2,0,2) + PDQ(0,1,1)),
+    sarima002010 = ARIMA(box_cox(Rainfall, lambda_guerrero) ~ pdq(0,0,2) + PDQ(0,1,0)),
+    sarima200010 = ARIMA(box_cox(Rainfall, lambda_guerrero) ~ pdq(2,0,0) + PDQ(0,1,0)),
+    sarima200111 = ARIMA(box_cox(Rainfall, lambda_guerrero) ~ pdq(2,0,0) + PDQ(1,1,1)),
+    sarima200012 = ARIMA(box_cox(Rainfall, lambda_guerrero) ~ pdq(2, 0, 0) + PDQ(0,1,2)),
+    auto_ARIMA = ARIMA(box_cox(Rainfall, lambda_guerrero)))
+
+# ARIMA (p,d,q) (P,D,Q):
+
+# d = 0 since differencing was not applied to achieve stationarity
+# D = 1 since seasonal differencing was applied
+
+# p is usually set to 2 since we have a spike in lag 2 in the PACF plot
+# q is sometimes set to 2 due to a spike in lag 2 in the ACF plot
+
+# P is usually set to 0 due to no noticeable spikes at lags 12, 24, 36 in the PACF plot
+# Q is usually set to 1 due to a spike at lag 12 in ACF plot
+
+fit_1 %>% glance() 
+
+# Residuals, ljung_box test and box_pierce test
+
+# sarima002011
+fit_1 %>% select(sarima002011) %>% report()
+
+fit_1 %>%
+  select(sarima002011) %>%
+  gg_tsresiduals() + labs(title = "Residuals of sarima002011", x = 'Months [1M]')
+
+fit_1 %>%
+  select(sarima002011) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 36) 
+
+fit_1 %>%
+  select(sarima002011) %>%
+  augment() %>%
+  features(.innov, box_pierce, lag = 36)
+
+# sarima200011
+fit_1 %>% select(sarima200011) %>% report()
+
+fit_1 %>%
+  select(sarima200011) %>%
+  gg_tsresiduals() + labs(title = "Residuals of sarima200011", x = 'Months [1M]')
+
+fit_1 %>%
+  select(sarima200011) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 36) 
+
+fit_1 %>%
+  select(sarima200011) %>%
+  augment() %>%
+  features(.innov, box_pierce, lag = 36)
+
+# sarima202011
+fit_1 %>% select(sarima202011) %>% report()
+
+fit_1 %>%
+  select(sarima202011) %>%
+  gg_tsresiduals() + labs(title = "Residuals of sarima202011", x = 'Months [1M]')
+
+fit_1 %>%
+  select(sarima202011) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 36) 
+
+fit_1 %>%
+  select(sarima202011) %>%
+  augment() %>%
+  features(.innov, box_pierce, lag = 36)
+
+# sarima002010
+fit_1 %>% select(sarima002010) %>% report()
+
+fit_1 %>%
+  select(sarima002010) %>%
+  gg_tsresiduals() + labs(title = "Residuals of sarima002010", x = 'Months [1M]')
+
+fit_1 %>%
+  select(sarima002010) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 36) 
+
+fit_1 %>%
+  select(sarima002010) %>%
+  augment() %>%
+  features(.innov, box_pierce, lag = 36)
+
+# sarima200010
+fit_1 %>% select(sarima200010) %>% report()
+
+fit_1 %>%
+  select(sarima200010) %>%
+  gg_tsresiduals() + labs(title = "Residuals of sarima200010", x = 'Months [1M]')
+
+fit_1 %>%
+  select(sarima200010) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 36) 
+
+fit_1 %>%
+  select(sarima200010) %>%
+  augment() %>%
+  features(.innov, box_pierce, lag = 36)
+
+# sarima200111
+fit_1 %>% select(sarima200111) %>% report()
+
+fit_1 %>%
+  select(sarima200111) %>%
+  gg_tsresiduals() + labs(title = "Residuals of sarima200111", x = 'Months [1M]')
+
+fit_1 %>%
+  select(sarima200111) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 36) 
+
+fit_1 %>%
+  select(sarima200111) %>%
+  augment() %>%
+  features(.innov, box_pierce, lag = 36)
+
+# sarima200012
+fit_1 %>% select(sarima200012) %>% report()
+
+fit_1 %>%
+  select(sarima200012) %>%
+  gg_tsresiduals() + labs(title = "Residuals of sarima200012", x = 'Months [1M]')
+
+fit_1 %>%
+  select(sarima200012) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 36) 
+
+fit_1 %>%
+  select(sarima200012) %>%
+  augment() %>%
+  features(.innov, box_pierce, lag = 36)
+
+# auto_ARIMA
+fit_1 %>% select(auto_ARIMA) %>% report()
+
+fit_1 %>%
+  select(auto_ARIMA) %>%
+  gg_tsresiduals() + labs(title = "Residuals of auto_ARIMA", x = 'Months [1M]')
+
+fit_1 %>%
+  select(auto_ARIMA) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 36) 
+
+fit_1 %>%
+  select(auto_ARIMA) %>%
+  augment() %>%
+  features(.innov, box_pierce, lag = 36)
+
+# The p-values obtained from these tests are all greater than 5%
+# We fail to reject the null hypothesis - There is no statistical evidence for the presence of autocorrelation in the residuals.
+# We can proceed to the final step: forecasting
+
+fit_1 %>% forecast(h = '24 months') %>%
+  accuracy(rain_in_australia_ts_test)
+
+# sarima200211 and sarima200012 have the lowest error, so, they will be compared with Seasonal Naive
+
+final_fit <- rain_in_australia_ts_train %>%   
+  model(snaive = SNAIVE(box_cox(Rainfall, lambda_guerrero)),
+        sarima200111 = ARIMA(box_cox(Rainfall, lambda_guerrero) ~ pdq(2,0,0) + PDQ(0,1,1)),
+        sarima200012 = ARIMA(box_cox(Rainfall, lambda_guerrero) ~ pdq(2, 0, 0) + PDQ(0,1,2)))
+
+final_fit %>%
+  forecast(h = '24 months') %>%
+  accuracy(rain_in_australia_ts_test)
+
+final_fit %>%
+  forecast(h = '30 months') %>%
+  autoplot(rain_in_australia_ts_train, level = FALSE) +
+  scale_fill_manual(values = c("#4bac39","#7e96ab","#6a329f")) +
+  scale_color_manual(values = c("#4bac39","#7e96ab","#6a329f")) +
+  ggtitle("Forecasts of Amount of Rain in Australia") +
+  xlab("Months [1M]") +
+  ylab("Total Amount of Rain, in mm") +
+  theme_minimal()
+
+# Among the models considered, SARIMA(2,0,0)(0,1,2) emerged with the lowest RMSE (0.944) and MAE (0.756), 
+# indicating superior performance in terms of these error metrics. 
+# Additionally, the ME value being very close to zero (-0.067) suggests minimal bias in the predictions. 
+# On the other hand, SARIMA(2,0,0)(1,1,1), also demonstrated commendable performance with low RMSE (0.943) and MAE (0.756) values. 
+# Also, similar to SARIMA(2,0,0)(0,1,2), its ME and ACF1 values are close to zero, indicating satisfactory model performance.
+
+# Selected model: SARIMA(2,0,0)(1,1,1)
+
+final_fit %>% select(sarima200111) %>% report()
+
+# Forecasting
+final_fit %>%
+  select(sarima200111) %>%
+  forecast(h = 30) %>%
+  autoplot(rain_in_australia_ts_test, level = NULL, color = "#7e96ab") +
+  ggtitle("Amount of Rainfall recorded in Australia, in mm") +
+  labs(subtitle = "Forecasts of SARIMA2000111") +
+  xlab("Months [1M]") + ylab("Rainfall") +
+  theme(panel.grid.major = element_line(color = "#eeeeee"),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"))
+
+final_fit %>%
+select(sarima200111) %>%
+gg_tsresiduals() + labs(title = "Residuals of SARIMA200111 model", x = 'Months [1M]')
+
+# Compute the difference between the forecast and the reality
+
+forecast_values <- sum(final_fit %>% select(sarima200111) %>% forecast(h = 30.5) %>% filter(year(Month) >= 2015) %>% pull(.mean))
+
+real_values <- sum(rain_in_australia_ts_test %>% pull(Rainfall))
+
+(real_values / forecast_values) * 100 # Correct values predicted
+
+
+

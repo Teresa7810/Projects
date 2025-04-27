@@ -1,0 +1,7 @@
+:root {
+  --text-bold-color: #000000;
+}
+
+strong {
+  font-weight: bold;
+  color: var(--text-bold-color);
